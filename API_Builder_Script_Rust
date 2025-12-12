@@ -1,0 +1,305 @@
+use clap::Parser;
+use futures::stream::{self, StreamExt};
+use regex::Regex;
+use reqwest::header;
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
+use std::fs::File;
+use std::io::Write;
+use std::sync::OnceLock;
+use std::time::Instant;
+use url::Url;
+
+// --- Global Regex Definitions ---
+static RE_GQL_START: OnceLock<Regex> = OnceLock::new();
+static RE_API_ENDPOINT: OnceLock<Regex> = OnceLock::new();
+static RE_AUTH_HEADER: OnceLock<Regex> = OnceLock::new();
+// NEW: Finds any string that looks like a relative or absolute JS path
+static RE_JS_FILE: OnceLock<Regex> = OnceLock::new();
+
+fn get_gql_start_regex() -> &'static Regex {
+    RE_GQL_START.get_or_init(|| Regex::new(r#"(query|mutation|subscription)\s+(\w+)"#).unwrap())
+}
+fn get_api_endpoint_regex() -> &'static Regex {
+    RE_API_ENDPOINT.get_or_init(|| Regex::new(r#""((?:https?://[^"]+)?/(?:graphql|api|v1/[^"]+))""#).unwrap())
+}
+fn get_auth_header_regex() -> &'static Regex {
+    RE_AUTH_HEADER.get_or_init(|| Regex::new(r#""(Authorization|x-api-key|Bearer|x-auth-token)"\s*[:=]\s*"([^"]+)""#).unwrap())
+}
+fn get_js_file_regex() -> &'static Regex {
+    // Matches /abc/xyz.js or https://.../xyz.js inside quotes
+    RE_JS_FILE.get_or_init(|| Regex::new(r#"["']((?:https?://|/)[^"']+\.js)["']"#).unwrap())
+}
+
+#[derive(Parser, Debug)]
+struct Args {
+    #[arg(short, long)]
+    url: String,
+
+    #[arg(short, long, default_value_t = 50)]
+    concurrency: usize,
+}
+
+#[derive(Deserialize)]
+struct SourceMap {
+    #[serde(rename = "sourcesContent")]
+    sources_content: Option<Vec<Option<String>>>,
+}
+
+#[derive(Serialize, Clone, Debug, Eq, PartialEq, Hash)]
+struct GqlOperation {
+    name: String,
+    op_type: String,
+    body: String,
+    source_file: String,
+}
+
+#[derive(Serialize, Clone, Debug, Eq, PartialEq, Hash)]
+struct DiscoveredEndpoint {
+    url: String,
+    source_file: String,
+}
+
+struct ScanResult {
+    ops: Vec<GqlOperation>,
+    endpoints: Vec<DiscoveredEndpoint>,
+    headers: HashMap<String, String>,
+}
+
+// --- Logic: Cleaner ---
+
+fn extract_clean_graphql(content: &str, source_file: &str) -> Vec<GqlOperation> {
+    let mut operations = Vec::new();
+    let re = get_gql_start_regex();
+
+    for match_item in re.find_iter(content) {
+        let start_idx = match_item.start();
+        
+        let mut slice_end = std::cmp::min(content.len(), start_idx + 3000);
+        while !content.is_char_boundary(slice_end) {
+            slice_end -= 1;
+        }
+
+        let raw_slice = &content[start_idx..slice_end];
+
+        let mut open_braces = 0;
+        let mut end_idx = 0;
+        let mut found_start_brace = false;
+
+        for (i, c) in raw_slice.char_indices() {
+            if c == '{' {
+                open_braces += 1;
+                found_start_brace = true;
+            } else if c == '}' {
+                if open_braces > 0 {
+                    open_braces -= 1;
+                }
+            }
+
+            if found_start_brace && open_braces == 0 {
+                end_idx = i + 1;
+                break;
+            }
+        }
+
+        if end_idx > 0 {
+            let safe_end = if end_idx > raw_slice.len() { raw_slice.len() } else { end_idx };
+            let extracted = &raw_slice[..safe_end];
+            
+            let clean_body = extracted
+                .replace("\\n", "\n")
+                .replace("\\r", "")
+                .replace("\\\"", "\"")
+                .replace("\\t", "  ");
+
+            if let Some(caps) = re.captures(&clean_body) {
+                operations.push(GqlOperation {
+                    op_type: caps[1].to_string(),
+                    name: caps[2].to_string(),
+                    body: clean_body,
+                    source_file: source_file.to_string(),
+                });
+            }
+        }
+    }
+    operations
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args = Args::parse();
+    let start_time = Instant::now();
+
+    // 1. Setup Client with "Real Browser" Headers
+    let target_url = if args.url.ends_with('/') {
+        args.url.trim_end_matches('/').to_string()
+    } else {
+        args.url.clone()
+    };
+
+    println!("--- STEP 1: Aggressive Targeting [{}] ---", target_url);
+
+    let mut headers = header::HeaderMap::new();
+    headers.insert(header::USER_AGENT, header::HeaderValue::from_static("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"));
+    headers.insert(header::ACCEPT, header::HeaderValue::from_static("text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8"));
+    headers.insert(header::ACCEPT_LANGUAGE, header::HeaderValue::from_static("en-US,en;q=0.9"));
+    // Referer often tricks basic bot detection
+    headers.insert(header::REFERER, header::HeaderValue::from_str(&target_url)?);
+
+    let client = reqwest::Client::builder()
+        .default_headers(headers)
+        .timeout(std::time::Duration::from_secs(15))
+        .danger_accept_invalid_certs(true)
+        .build()?;
+
+    // 2. Fetch Homepage (Raw Text)
+    let res = client.get(&target_url).send().await?.text().await?;
+    let base_url = Url::parse(&target_url)?;
+
+    let mut js_urls = HashSet::new();
+
+    // 3. Brute Force Regex Scan of HTML
+    // We do NOT parse the DOM. We look for *any* string ending in .js inside quotes.
+    // This finds scripts hidden in JSON blobs, <link rel="preload">, and dynamic loaders.
+    let re_js = get_js_file_regex();
+    for cap in re_js.captures_iter(&res) {
+        let raw_path = &cap[1];
+        
+        // Filter out obvious junk (analytics, ads, etc. if you wanted, but we keep most)
+        if raw_path.contains("google") || raw_path.contains("facebook") { continue; }
+
+        if raw_path.starts_with("http") {
+            js_urls.insert(raw_path.to_string());
+        } else if let Ok(absolute) = base_url.join(raw_path) {
+            js_urls.insert(absolute.to_string());
+        }
+    }
+
+    println!("--- STEP 2: Found {} JS Candidates via Brute Force ---", js_urls.len());
+    
+    // 4. Concurrent Deep Scan
+    let results: Vec<ScanResult> = stream::iter(js_urls)
+        .map(|url| {
+            let client = client.clone();
+            async move {
+                let mut endpoints = Vec::new();
+                let mut headers = HashMap::new();
+                let mut content_to_scan = String::new();
+
+                // Fetch JS
+                if let Ok(resp) = client.get(&url).send().await {
+                    if let Ok(text) = resp.text().await {
+                        content_to_scan.push_str(&text);
+                    }
+                }
+
+                // Check Source Map
+                let map_url = format!("{}.map", url);
+                if let Ok(resp) = client.get(&map_url).send().await {
+                    if resp.status().is_success() {
+                        if let Ok(map_text) = resp.text().await {
+                            if let Ok(parsed_map) = serde_json::from_str::<SourceMap>(&map_text) {
+                                if let Some(sources) = parsed_map.sources_content {
+                                    content_to_scan.push('\n'); 
+                                    for source_code in sources.into_iter().flatten() {
+                                        content_to_scan.push_str(&source_code);
+                                        content_to_scan.push('\n');
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if content_to_scan.is_empty() {
+                    return ScanResult { ops: vec![], endpoints: vec![], headers: HashMap::new() };
+                }
+
+                // Scan Logic
+                let ops = extract_clean_graphql(&content_to_scan, &url);
+
+                let re_api = get_api_endpoint_regex();
+                for cap in re_api.captures_iter(&content_to_scan) {
+                    endpoints.push(DiscoveredEndpoint {
+                        url: cap[1].to_string(),
+                        source_file: url.clone(),
+                    });
+                }
+
+                let re_auth = get_auth_header_regex();
+                for cap in re_auth.captures_iter(&content_to_scan) {
+                    headers.insert(cap[1].to_string(), cap[2].to_string());
+                }
+
+                ScanResult { ops, endpoints, headers }
+            }
+        })
+        .buffer_unordered(args.concurrency)
+        .collect()
+        .await;
+
+    // 5. Aggregation
+    let mut unique_ops = HashMap::new();
+    let mut unique_endpoints = HashSet::new();
+    let mut all_headers = HashMap::new();
+
+    for res in results {
+        for op in res.ops {
+            unique_ops.entry(op.name.clone())
+                .and_modify(|existing: &mut GqlOperation| {
+                    if op.body.len() > existing.body.len() {
+                        *existing = op.clone();
+                    }
+                })
+                .or_insert(op);
+        }
+        for ep in res.endpoints { unique_endpoints.insert(ep); }
+        all_headers.extend(res.headers);
+    }
+
+    let mut sorted_ops: Vec<_> = unique_ops.values().cloned().collect();
+    sorted_ops.sort_by(|a, b| a.name.cmp(&b.name));
+
+    // 6. Report
+    println!("\n========== RESULTS ==========");
+    println!("Operations Found: {}", sorted_ops.len());
+    println!("Endpoints Found:  {}", unique_endpoints.len());
+    
+    let json_filename = "api_intelligence.json";
+    let json_file = File::create(json_filename)?;
+    
+    #[derive(Serialize)]
+    struct FinalOutput {
+        target: String,
+        endpoints: Vec<DiscoveredEndpoint>,
+        headers: HashMap<String, String>,
+        operations: Vec<GqlOperation>,
+    }
+
+    let output_data = FinalOutput {
+        target: target_url,
+        endpoints: unique_endpoints.into_iter().collect(),
+        headers: all_headers,
+        operations: sorted_ops.clone(),
+    };
+
+    serde_json::to_writer_pretty(json_file, &output_data)?;
+    println!("[+] Intelligence saved to: {}", json_filename);
+
+    if !sorted_ops.is_empty() {
+        let gql_filename = "extracted_schema.graphql";
+        let mut gql_file = File::create(gql_filename)?;
+        
+        writeln!(gql_file, "# Auto-generated from scan")?;
+        writeln!(gql_file, "# Total Operations: {}\n", sorted_ops.len())?;
+
+        for op in sorted_ops {
+            writeln!(gql_file, "# Source: {}", op.source_file)?;
+            writeln!(gql_file, "{}\n", op.body)?;
+        }
+        println!("[+] Clean Schema saved to: {}", gql_filename);
+    }
+
+    println!("Done in {:.2?}!", start_time.elapsed());
+    Ok(())
+}
