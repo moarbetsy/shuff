@@ -1,5 +1,5 @@
 ### PROFIL PROFESSIONNEL
-Ingénieur logiciel polyvalent spécialisé dans le **développement d'agents autonomes**, le **reverse engineering** et l'**architecture de systèmes distribués**. Expert dans la conception de solutions d'automatisation haute performance et d'infrastructures de confidentialité numérique (Anti-Detect). Passionné par l'intersection entre l'IA générative (LLM), la cybersécurité offensive/défensive et le traitement de données en temps réel.
+Développeur logiciel polyvalent spécialisé dans le **développement d'agents autonomes**, le **reverse engineering** et l'**architecture de systèmes distribués**. Expert dans la conception de solutions d'automatisation haute performance et d'infrastructures de confidentialité numérique (Anti-Detect). Passionné par l'intersection entre l'IA générative (LLM), la cybersécurité offensive/défensive et le traitement de données en temps réel.
 
 ---
 
